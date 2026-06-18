@@ -540,7 +540,10 @@
       }];
     } videoWriterCallback:^{
       if (self->_videoController.isAudioEnabled) {
-        [self->_audioOutput setSampleBufferDelegate:self queue:self->_dispatchQueue];
+        AVCaptureAudioDataOutput *audioOutput = [self audioOutputInCaptureSession];
+        if (audioOutput != nil) {
+          [audioOutput setSampleBufferDelegate:self queue:self->_dispatchQueue];
+        }
       }
       [self->_captureVideoOutput setSampleBufferDelegate:self queue:self->_dispatchQueue];
       
@@ -605,30 +608,61 @@
 }
 
 # pragma mark - Audio
+
+- (BOOL)hasAudioInputInCaptureSession {
+  for (AVCaptureInput *input in [_captureSession inputs]) {
+    for (AVCaptureInputPort *port in input.ports) {
+      if ([[port mediaType] isEqual:AVMediaTypeAudio]) {
+        return YES;
+      }
+    }
+  }
+  return NO;
+}
+
+- (AVCaptureAudioDataOutput *)audioOutputInCaptureSession {
+  for (AVCaptureOutput *output in [_captureSession outputs]) {
+    if ([output isKindOfClass:[AVCaptureAudioDataOutput class]]) {
+      return (AVCaptureAudioDataOutput *)output;
+    }
+  }
+  return nil;
+}
+
 /// Setup audio channel to record audio
 - (void)setUpCaptureSessionForAudioError:(nonnull void (^)(NSError *))error {
+  AVCaptureAudioDataOutput *existingAudioOutput = [self audioOutputInCaptureSession];
+  if (existingAudioOutput != nil && [self hasAudioInputInCaptureSession]) {
+    // Audio is already wired in the session (e.g. after photo -> video -> photo -> video).
+    // Reusing it avoids overwriting _audioOutput with a new instance that never gets added.
+    _audioOutput = existingAudioOutput;
+    [_videoController setIsAudioSetup:YES];
+    return;
+  }
+
   NSError *audioError = nil;
-  // Create a device input with the device and add it to the session.
-  // Setup the audio input.
   AVCaptureDevice *audioDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
   AVCaptureDeviceInput *audioInput = [AVCaptureDeviceInput deviceInputWithDevice:audioDevice
                                                                            error:&audioError];
   if (audioError) {
     error(audioError);
+    return;
   }
-  
-  // Setup the audio output.
-  _audioOutput = [[AVCaptureAudioDataOutput alloc] init];
-  
+
+  AVCaptureAudioDataOutput *audioOutput = [[AVCaptureAudioDataOutput alloc] init];
+
   if ([_captureSession canAddInput:audioInput]) {
     [_captureSession addInput:audioInput];
-    
-    if ([_captureSession canAddOutput:_audioOutput]) {
-      [_captureSession addOutput:_audioOutput];
+
+    if ([_captureSession canAddOutput:audioOutput]) {
+      [_captureSession addOutput:audioOutput];
+      _audioOutput = audioOutput;
       [_videoController setIsAudioSetup:YES];
     } else {
       [_videoController setIsAudioSetup:NO];
     }
+  } else {
+    [_videoController setIsAudioSetup:NO];
   }
 }
 
@@ -653,7 +687,7 @@
       // Assuming it can differentiate based on 'output' or buffer type.
       [_videoController captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection captureVideoOutput:_captureVideoOutput];
     }
-  } else if (output == _audioOutput) {
+  } else if ([output isKindOfClass:[AVCaptureAudioDataOutput class]]) {
     // Send audio buffers only to video recording controller if recording & audio enabled
     if (_videoController.isRecording && _videoController.isAudioEnabled) {
       [_videoController captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection captureVideoOutput:nil]; // Pass nil for video output for audio

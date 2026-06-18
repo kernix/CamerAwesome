@@ -40,6 +40,8 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
   _isRecording = YES;
   _videoTimeOffset = CMTimeMake(0, 1);
   _audioTimeOffset = CMTimeMake(0, 1);
+  _lastVideoSampleTime = kCMTimeInvalid;
+  _lastAudioSampleTime = kCMTimeInvalid;
   _videoIsDisconnected = NO;
   _audioIsDisconnected = NO;
   
