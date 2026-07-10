@@ -6,16 +6,21 @@
 //
 
 #import "VideoController.h"
+#import "AspectRatioUtils.h"
 
 FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
 
-@implementation VideoController
+@implementation VideoController {
+  AspectRatio _aspectRatio;
+  BOOL _sessionStarted;
+}
 
 - (instancetype)init {
   self = [super init];
   _isRecording = NO;
   _isAudioEnabled = YES;
   _isPaused = NO;
+  _aspectRatio = Ratio4_3;
   
   return self;
 }
@@ -38,6 +43,7 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
   videoWriterCallback();
   
   _isRecording = YES;
+  _sessionStarted = NO;
   _videoTimeOffset = CMTimeMake(0, 1);
   _audioTimeOffset = CMTimeMake(0, 1);
   _lastVideoSampleTime = kCMTimeInvalid;
@@ -57,21 +63,38 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
     // Reset camera FPS
     [self adjustCameraFPS:@(30)];
   }
-  
-  if (_isRecording) {
-    _isRecording = NO;
-    if (_videoWriter.status != AVAssetWriterStatusUnknown) {
-      [_videoWriter finishWritingWithCompletionHandler:^{
-        if (self->_videoWriter.status == AVAssetWriterStatusCompleted) {
-          completion(@(YES), nil);
-        } else {
-          completion(@(NO), [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"impossible to completely write video" details:@""]);
-        }
-      }];
+
+  @synchronized(self) {
+    if (!_isRecording) {
+      completion(@(NO), [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"video is not recording" details:@""]);
+      return;
     }
-  } else {
-    completion(@(NO), [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"video is not recording" details:@""]);
+    _isRecording = NO;
   }
+
+  AVAssetWriterStatus writerStatus = _videoWriter.status;
+  if (writerStatus == AVAssetWriterStatusWriting) {
+    [_videoWriterInput markAsFinished];
+    if (_audioWriterInput != nil) {
+      [_audioWriterInput markAsFinished];
+    }
+    [_videoWriter finishWritingWithCompletionHandler:^{
+      self->_sessionStarted = NO;
+      if (self->_videoWriter.status == AVAssetWriterStatusCompleted) {
+        completion(@(YES), nil);
+      } else {
+        completion(@(NO), [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"impossible to completely write video" details:@""]);
+      }
+    }];
+    return;
+  }
+
+  _sessionStarted = NO;
+  if (writerStatus == AVAssetWriterStatusCompleted) {
+    completion(@(YES), nil);
+    return;
+  }
+  completion(@(NO), [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"video is not recording" details:@""]);
 }
 
 - (void)pauseVideoRecording {
@@ -176,10 +199,13 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
 
 /// Append audio data
 - (void)newAudioSample:(CMSampleBufferRef)sampleBuffer {
-  if (_videoWriter.status != AVAssetWriterStatusWriting) {
-    if (_videoWriter.status == AVAssetWriterStatusFailed) {
-      //      *error = [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"writing video failed" details:_videoWriter.error];
+  @synchronized(self) {
+    if (!_isRecording) {
+      return;
     }
+  }
+
+  if (_videoWriter.status != AVAssetWriterStatusWriting) {
     return;
   }
   if (_audioWriterInput.readyForMoreMediaData) {
@@ -223,26 +249,60 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
   }
 }
 
+- (BOOL)canAcceptMediaForWriter:(AVAssetWriter *)writer {
+  @synchronized(self) {
+    if (!_isRecording || writer == nil) {
+      return NO;
+    }
+  }
+
+  AVAssetWriterStatus status = writer.status;
+  return status == AVAssetWriterStatusUnknown || status == AVAssetWriterStatusWriting;
+}
+
+- (BOOL)startWriterSessionIfNeededAtTime:(CMTime)time {
+  AVAssetWriterStatus status = _videoWriter.status;
+  if (status == AVAssetWriterStatusCompleted ||
+      status == AVAssetWriterStatusCancelled ||
+      status == AVAssetWriterStatusFailed) {
+    return NO;
+  }
+
+  if (_sessionStarted) {
+    return status == AVAssetWriterStatusWriting;
+  }
+
+  if (status != AVAssetWriterStatusUnknown) {
+    return NO;
+  }
+
+  if (![_videoWriter startWriting]) {
+    return NO;
+  }
+  [_videoWriter startSessionAtSourceTime:time];
+  _sessionStarted = YES;
+  return YES;
+}
+
 # pragma mark - Camera Delegates
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection captureVideoOutput:(AVCaptureVideoDataOutput *)captureVideoOutput {
-  
+
   if (self.isPaused) {
     return;
   }
-  
-  if (_videoWriter.status == AVAssetWriterStatusFailed) {
-    //    _result([FlutterError errorWithCode:@"VIDEO_ERROR" message:@"impossible to write video " details:_videoWriter.error]);
+
+  if (![self canAcceptMediaForWriter:_videoWriter]) {
     return;
   }
-  
+
   CFRetain(sampleBuffer);
   CMTime currentSampleTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-  
-  if (_videoWriter.status != AVAssetWriterStatusWriting) {
-    [_videoWriter startWriting];
-    [_videoWriter startSessionAtSourceTime:currentSampleTime];
+
+  if (![self startWriterSessionIfNeededAtTime:currentSampleTime]) {
+    CFRelease(sampleBuffer);
+    return;
   }
-  
+
   if (output == captureVideoOutput) {
     if (_videoIsDisconnected) {
       _videoIsDisconnected = NO;
@@ -253,15 +313,41 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
         CMTime offset = CMTimeSubtract(currentSampleTime, _lastVideoSampleTime);
         _videoTimeOffset = CMTimeAdd(_videoTimeOffset, offset);
       }
-      
+
+      CFRelease(sampleBuffer);
       return;
     }
-    
+
     _lastVideoSampleTime = currentSampleTime;
-    
+
+    BOOL canAppendVideo = NO;
+    @synchronized(self) {
+      canAppendVideo = _isRecording &&
+          _videoWriter.status == AVAssetWriterStatusWriting &&
+          _videoWriterInput.readyForMoreMediaData;
+    }
+
+    if (!canAppendVideo) {
+      CFRelease(sampleBuffer);
+      return;
+    }
+
     CVPixelBufferRef nextBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    CVPixelBufferRef croppedBuffer = [self croppedPixelBufferFromBuffer:nextBuffer];
+    CVPixelBufferRef bufferToAppend = croppedBuffer != NULL ? croppedBuffer : nextBuffer;
     CMTime nextSampleTime = CMTimeSubtract(_lastVideoSampleTime, _videoTimeOffset);
-    [_videoAdaptor appendPixelBuffer:nextBuffer withPresentationTime:nextSampleTime];
+
+    @synchronized(self) {
+      if (_isRecording &&
+          _videoWriter.status == AVAssetWriterStatusWriting &&
+          _videoWriterInput.readyForMoreMediaData) {
+        [_videoAdaptor appendPixelBuffer:bufferToAppend withPresentationTime:nextSampleTime];
+      }
+    }
+
+    if (croppedBuffer != NULL) {
+      CVPixelBufferRelease(croppedBuffer);
+    }
   } else {
     CMTime dur = CMSampleBufferGetDuration(sampleBuffer);
     
@@ -277,7 +363,8 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
         CMTime offset = CMTimeSubtract(currentSampleTime, _lastAudioSampleTime);
         _audioTimeOffset = CMTimeAdd(_audioTimeOffset, offset);
       }
-      
+
+      CFRelease(sampleBuffer);
       return;
     }
     
@@ -390,13 +477,85 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
       size = CGSizeMake(960, 540);
       break;
   }
+
+  size = [AspectRatioUtils croppedLandscapeSizeForAspectRatio:_aspectRatio sourceSize:size];
     
   // ensure video output size does not exceed capture session size
-  if (size.width > _previewSize.width) {
-    size = _previewSize;
+  CGSize maxPreviewSize = [AspectRatioUtils croppedLandscapeSizeForAspectRatio:_aspectRatio sourceSize:_previewSize];
+  if (size.width > maxPreviewSize.width || size.height > maxPreviewSize.height) {
+    size = maxPreviewSize;
   }
   
   return size;
+}
+
+- (CVPixelBufferRef)croppedPixelBufferFromBuffer:(CVPixelBufferRef)pixelBuffer {
+  if (pixelBuffer == NULL || _aspectRatio == Ratio16_9) {
+    return NULL;
+  }
+
+  size_t width = CVPixelBufferGetWidth(pixelBuffer);
+  size_t height = CVPixelBufferGetHeight(pixelBuffer);
+  CGRect cropRect = [AspectRatioUtils previewAlignedCropRectForBufferSize:CGSizeMake(width, height)
+                                                              aspectRatio:_aspectRatio];
+
+  if (CGRectEqualToRect(cropRect, CGRectMake(0, 0, width, height))) {
+    return NULL;
+  }
+
+  if (cropRect.origin.x < 0 || cropRect.origin.y < 0 ||
+      CGRectGetMaxX(cropRect) > width || CGRectGetMaxY(cropRect) > height) {
+    return NULL;
+  }
+
+  CVPixelBufferRef outputBuffer = NULL;
+  CVReturn status = kCVReturnSuccess;
+  if (_videoAdaptor.pixelBufferPool != NULL) {
+    status = CVPixelBufferPoolCreatePixelBuffer(NULL, _videoAdaptor.pixelBufferPool, &outputBuffer);
+  }
+
+  if (status != kCVReturnSuccess || outputBuffer == NULL) {
+    NSDictionary *pixelBufferAttributes = @{
+      (NSString *)kCVPixelBufferPixelFormatTypeKey: @(videoFormat),
+      (NSString *)kCVPixelBufferWidthKey: @(cropRect.size.width),
+      (NSString *)kCVPixelBufferHeightKey: @(cropRect.size.height),
+      (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    status = CVPixelBufferCreate(kCFAllocatorDefault,
+                                 cropRect.size.width,
+                                 cropRect.size.height,
+                                 videoFormat,
+                                 (__bridge CFDictionaryRef)pixelBufferAttributes,
+                                 &outputBuffer);
+  }
+
+  if (status != kCVReturnSuccess || outputBuffer == NULL) {
+    return NULL;
+  }
+
+  CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+  CVPixelBufferLockBaseAddress(outputBuffer, 0);
+
+  uint8_t *sourceAddress = (uint8_t *)CVPixelBufferGetBaseAddress(pixelBuffer);
+  uint8_t *destinationAddress = (uint8_t *)CVPixelBufferGetBaseAddress(outputBuffer);
+  size_t sourceBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer);
+  size_t destinationBytesPerRow = CVPixelBufferGetBytesPerRow(outputBuffer);
+  size_t cropX = (size_t)cropRect.origin.x;
+  size_t cropY = (size_t)cropRect.origin.y;
+  size_t cropWidth = (size_t)cropRect.size.width;
+  size_t cropHeight = (size_t)cropRect.size.height;
+  size_t bytesPerPixel = 4;
+
+  for (size_t row = 0; row < cropHeight; row++) {
+    memcpy(destinationAddress + row * destinationBytesPerRow,
+           sourceAddress + (cropY + row) * sourceBytesPerRow + cropX * bytesPerPixel,
+           cropWidth * bytesPerPixel);
+  }
+
+  CVPixelBufferUnlockBaseAddress(outputBuffer, 0);
+  CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+
+  return outputBuffer;
 }
 
 # pragma mark - Setter
@@ -409,6 +568,10 @@ FourCharCode const videoFormat = kCVPixelFormatType_32BGRA;
 
 - (void)setPreviewSize:(CGSize)previewSize {
   _previewSize = previewSize;
+}
+
+- (void)setAspectRatio:(AspectRatio)aspectRatio {
+  _aspectRatio = aspectRatio;
 }
 
 - (void)setVideoIsDisconnected:(bool)videoIsDisconnected {

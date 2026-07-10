@@ -60,6 +60,7 @@
   
   // Controllers init
   _videoController = [[VideoController alloc] init];
+  [_videoController setAspectRatio:aspectRatioMode];
   _imageStreamController = [[ImageStreamController alloc] initWithStreamImages:streamImages];
   _motionController = [[MotionController alloc] init];
   _locationController = [[LocationController alloc] init];
@@ -78,6 +79,7 @@
 
 - (void)setAspectRatio:(AspectRatio)ratio {
   _aspectRatio = ratio;
+  [_videoController setAspectRatio:ratio];
 }
 
 /// Set image stream Flutter sink
@@ -566,11 +568,15 @@
 
 /// Stop recording video
 - (void)stopRecordingVideo:(nonnull void (^)(NSNumber * _Nullable, FlutterError * _Nullable))completion {
-  if (_videoController.isRecording) {
-    [_videoController stopRecordingVideo:completion];
-  } else {
+  if (!_videoController.isRecording) {
     completion(@(NO), [FlutterError errorWithCode:@"VIDEO_ERROR" message:@"video is not recording" details:@""]);
+    return;
   }
+
+  // Serialize with in-flight sample buffers delivered on the capture queue.
+  dispatch_async(_dispatchQueue, ^{
+    [self->_videoController stopRecordingVideo:completion];
+  });
 }
 
 /// Set audio recording mode

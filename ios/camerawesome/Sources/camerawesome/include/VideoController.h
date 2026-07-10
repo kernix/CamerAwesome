@@ -9,6 +9,7 @@
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import "Pigeon.h"
+#import "AspectRatio.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -48,6 +49,7 @@ typedef void(^OnVideoWriterSetup)(void);
 - (void)setVideoIsDisconnected:(bool)videoIsDisconnected;
 - (void)setAudioIsDisconnected:(bool)audioIsDisconnected;
 - (void)setPreviewSize:(CGSize)previewSize;
+- (void)setAspectRatio:(AspectRatio)aspectRatio;
 - (void)updateCaptureDevice:(AVCaptureDevice *)device;
 
 @end
